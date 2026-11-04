@@ -119,6 +119,21 @@ void PltSleepMs(int ms) {
 #endif
 }
 
+void PltSleepUs(int us) {
+#if defined(LC_WINDOWS)
+    if (us >= 1000) {
+        Sleep(us / 1000);
+    }
+    else {
+        SwitchToThread();
+    }
+#elif defined(__3DS__)
+    svcSleepThread((s64)us * 1000);
+#else
+    usleep(us);
+#endif
+}
+
 void PltSleepMsInterruptible(PLT_THREAD* thread, int ms) {
     while (ms > 0 && !PltIsThreadInterrupted(thread)) {
         int msToSleep = ms < INTERRUPT_PERIOD_MS ? ms : INTERRUPT_PERIOD_MS;

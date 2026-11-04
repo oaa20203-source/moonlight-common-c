@@ -41,7 +41,10 @@ static uint8_t currentPenButtonState;
 // per millisecond, we'll wait a little bit to try to batch with
 // the next one. This batching wait paradoxically _decreases_
 // effective input latency by avoiding packet queuing in ENet.
-#define MOUSE_BATCHING_INTERVAL_MS 1
+// Mouse movement goes out at most every 400 us (2500 Hz). Movement in between
+// is summed into the next packet, so nothing is lost; the cap keeps uplink
+// packets (which compete with incoming video for Wi-Fi airtime) bounded.
+#define MOUSE_BATCHING_INTERVAL_US 400
 #define PEN_BATCHING_INTERVAL_MS 1
 
 // Don't batch up/down/cancel events
@@ -378,13 +381,13 @@ static void inputSendThreadProc(void* context) {
         }
         // If it's a relative mouse move packet, we can do batching
         else if (holder->packet.header.magic == relMouseMagicLE) {
-            uint64_t now = PltGetMillis();
+            uint64_t now = PltGetMicroseconds();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
+                PltSleepUs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US - now));
+                now = PltGetMicroseconds();
             }
 
             PltLockMutex(&batchedInputMutex);
@@ -449,13 +452,13 @@ static void inputSendThreadProc(void* context) {
         }
         // If it's an absolute mouse move packet, we should only send the latest
         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
-            uint64_t now = PltGetMillis();
+            uint64_t now = PltGetMicroseconds();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
+                PltSleepUs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US - now));
+                now = PltGetMicroseconds();
             }
 
             PltLockMutex(&batchedInputMutex);

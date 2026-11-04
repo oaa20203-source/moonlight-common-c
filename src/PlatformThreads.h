@@ -81,4 +81,6 @@ void PltSignalConditionVariable(PLT_COND* cond);
 void PltWaitForConditionVariable(PLT_COND* cond, PLT_MUTEX* mutex);
 
 void PltSleepMs(int ms);
+// Sub-millisecond sleep (POSIX); on Windows it sleeps the nearest whole millisecond or yields.
+void PltSleepUs(int us);
 void PltSleepMsInterruptible(PLT_THREAD* thread, int ms);
