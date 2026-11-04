@@ -68,7 +68,10 @@ static void AudioPingThreadProc(void* context) {
 
 // Initialize the audio stream and start
 int initializeAudioStream(void) {
-    LbqInitializeLinkedBlockingQueue(&packetQueue, 30);
+    // 500 ms of room: after a Wi-Fi blip the held-up packets arrive all at
+    // once, and a 150 ms queue overflowed and flushed every packet in it.
+    // The renderer's catch-up drops absorb a burst more quietly.
+    LbqInitializeLinkedBlockingQueue(&packetQueue, 100);
     RtpaInitializeQueue(&rtpAudioQueue);
     lastSeq = 0;
     receivedDataFromPeer = false;
@@ -151,10 +154,18 @@ static bool queuePacketToLbq(PQUEUED_AUDIO_PACKET* packet) {
             *packet = NULL;
         }
         else if (err == LBQ_BOUND_EXCEEDED) {
-            Limelog("Audio packet queue overflow\n");
-
-            // The audio queue is full, so free all existing items and try again
-            freePacketList(LbqFlushQueueItems(&packetQueue));
+            // The audio queue is full. Drop the oldest half instead of every
+            // packet: Opus concealment covers the gap, and the newest audio is kept.
+            int droppedOldest = 0;
+            void* oldest;
+            while (LbqGetItemCount(&packetQueue) > 50 && LbqPollQueueElement(&packetQueue, &oldest) == LBQ_SUCCESS) {
+                free(oldest);
+                droppedOldest++;
+            }
+            Limelog("Audio packet queue overflow: dropped the oldest %d packets\n", droppedOldest);
+            if (droppedOldest == 0) {
+                freePacketList(LbqFlushQueueItems(&packetQueue));
+            }
         }
     } while (err == LBQ_BOUND_EXCEEDED);
 
