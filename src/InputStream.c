@@ -766,9 +766,14 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 
         holder->channelId = CTRL_CHANNEL_MOUSE;
 
-        // TODO: Send this as unreliable sequenced when we have a delayed reliable retransmission thread
-        // and protocol updates to allow us to determine which unreliable messages were dropped.
-        holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
+        // DeckVoid: relative mouse motion is sent unreliable-sequenced (ENet flags 0).
+        // Reliable ordered delivery made every later move wait behind one lost packet
+        // (ENet retransmits after RTT + 4*variance, ~40-250 ms on Wi-Fi) and made the
+        // input thread sleep up to 10 ms per packet in sendMessageEnet(), which showed as
+        // jitter while moving the mouse. A lost delta is a tiny under-rotation, not a
+        // visible fault; Sunshine-family hosts accept gaps (the encrypted control seq is
+        // only an IV there). sendMessageEnet() still forces reliable for GFE hosts.
+        holder->enetPacketFlags = 0;
 
         holder->packet.mouseMoveRel.header.size = BE32(sizeof(NV_REL_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
         if (AppVersionQuad[0] >= 5) {
@@ -832,7 +837,7 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         holder->channelId = CTRL_CHANNEL_MOUSE;
 
         // TODO: Send this as unreliable sequenced when we have a delayed reliable retransmission thread
-        holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
+        holder->enetPacketFlags = 0; // DeckVoid: unreliable-sequenced; a newer position supersedes a lost one
 
         holder->packet.mouseMoveAbs.header.size = BE32(sizeof(NV_ABS_MOUSE_MOVE_PACKET) - sizeof(uint32_t));
         holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
