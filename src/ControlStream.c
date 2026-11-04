@@ -1536,10 +1536,15 @@ static void controlReceiveThreadFunc(void* context) {
     }
 }
 
+extern volatile int LiMouseSendPacketCount;
+
 static void lossStatsThreadFunc(void* context) {
     PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
 
     BYTE_BUFFER byteBuffer;
+    unsigned int pingCount = 0;
+    int lastMousePackets = 0;
+    uint64_t lastUplinkLogMs = 0;
 
     if (usePeriodicPing) {
         char periodicPingPayload[8];
@@ -1589,6 +1594,23 @@ static void lossStatsThreadFunc(void* context) {
                 Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                 ListenerCallbacks.connectionTerminated(LastSocketFail());
                 return;
+            }
+
+            // Every 5 s, log how the uplink is doing: the control peer RTT and the
+            // mouse packet rate (uplink health is otherwise invisible in the client log)
+            if (++pingCount % (5000 / PERIODIC_PING_INTERVAL_MS) == 0 && peer != NULL) {
+                int mousePackets = LiMouseSendPacketCount;
+                uint64_t now = PltGetMillis();
+                int elapsedMs = lastUplinkLogMs ? (int)(now - lastUplinkLogMs) : 5000;
+                PltLockMutex(&enetMutex);
+                Limelog("Uplink: control RTT %u ms (var %u ms), ENet sent %u lost %u, mouse packets %d in %d ms (%d/s)\n",
+                        peer->roundTripTime, peer->roundTripTimeVariance,
+                        peer->packetsSent, peer->packetsLost,
+                        mousePackets - lastMousePackets, elapsedMs,
+                        elapsedMs > 0 ? (int)((mousePackets - lastMousePackets) * 1000LL / elapsedMs) : 0);
+                PltUnlockMutex(&enetMutex);
+                lastMousePackets = mousePackets;
+                lastUplinkLogMs = now;
             }
 
             // Wait a bit

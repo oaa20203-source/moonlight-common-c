@@ -1,4 +1,6 @@
 #include "Limelight-internal.h"
+
+#include <stdlib.h>
 #include "ControllerSpeakerPcm.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
@@ -45,6 +47,10 @@ static uint8_t currentPenButtonState;
 // is summed into the next packet, so nothing is lost; the cap keeps uplink
 // packets (which compete with incoming video for Wi-Fi airtime) bounded.
 #define MOUSE_BATCHING_INTERVAL_US 400
+// Overridable at launch with DECKVOID_MOUSE_SEND_US (100..10000) for A/B tests
+static int mouseBatchingIntervalUs = MOUSE_BATCHING_INTERVAL_US;
+// Mouse packets sent so far; the control stream logs the rate
+volatile int LiMouseSendPacketCount = 0;
 #define PEN_BATCHING_INTERVAL_MS 1
 
 // Don't batch up/down/cancel events
@@ -355,6 +361,13 @@ static void inputSendThreadProc(void* context) {
     uint64_t lastMousePacketTime = 0;
     uint64_t lastPenPacketTime = 0;
 
+    {
+        const char* env = getenv("DECKVOID_MOUSE_SEND_US");
+        int us = env != NULL ? atoi(env) : 0;
+        mouseBatchingIntervalUs = (us >= 100 && us <= 10000) ? us : MOUSE_BATCHING_INTERVAL_US;
+        Limelog("Mouse send interval: %d us\n", mouseBatchingIntervalUs);
+    }
+
     while (!PltIsThreadInterrupted(&inputSendThread)) {
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
         if (err != LBQ_SUCCESS) {
@@ -384,9 +397,9 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMicroseconds();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US) {
+            if (now < lastMousePacketTime + (uint64_t)mouseBatchingIntervalUs) {
                 flushInputOnControlStream();
-                PltSleepUs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US - now));
+                PltSleepUs((int)(lastMousePacketTime + mouseBatchingIntervalUs - now));
                 now = PltGetMicroseconds();
             }
 
@@ -444,6 +457,7 @@ static void inputSendThreadProc(void* context) {
             PltUnlockMutex(&batchedInputMutex);
 
             lastMousePacketTime = now;
+            LiMouseSendPacketCount++;
 
             // We sent everything we needed in the loop above, so we can just free the
             // holder of the original packet and wait for another input event.
@@ -455,9 +469,9 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMicroseconds();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US) {
+            if (now < lastMousePacketTime + (uint64_t)mouseBatchingIntervalUs) {
                 flushInputOnControlStream();
-                PltSleepUs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_US - now));
+                PltSleepUs((int)(lastMousePacketTime + mouseBatchingIntervalUs - now));
                 now = PltGetMicroseconds();
             }
 
@@ -481,6 +495,7 @@ static void inputSendThreadProc(void* context) {
             PltUnlockMutex(&batchedInputMutex);
 
             lastMousePacketTime = now;
+            LiMouseSendPacketCount++;
         }
         // If it's a pen packet, we should only send the latest move or hover events
         else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
