@@ -31,6 +31,15 @@ static uint16_t pyrowaveCriticalPackets;
 #define CONSECUTIVE_DROP_LIMIT 120
 static unsigned int consecutiveFrameDrops;
 
+// Sunshine-protocol hosts expand an RFI request to their last encoded frame,
+// so re-sending the same range with a growing end frame for every complete
+// frame we discard while waiting for the RFI frame carries no information and
+// floods the reliable control channel that mouse and gamepad input share.
+// Rate-limit those re-sends; genuine new losses still report immediately.
+// GFE hosts keep per-frame updates.
+#define RFI_WAIT_REREPORT_INTERVAL_US 100000
+static uint64_t lastRfiReportTimeUs;
+
 static LINKED_BLOCKING_QUEUE decodeUnitQueue;
 
 typedef struct _BUFFER_DESC {
@@ -79,6 +88,7 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     pyrowaveCriticalPackets = 0;
+    lastRfiReportTimeUs = 0;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
 
@@ -804,6 +814,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         }
         else {
             connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+            lastRfiReportTimeUs = PltGetMicroseconds();
         }
         return;
     }
@@ -1079,6 +1090,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                 }
                 else {
                     connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+                    lastRfiReportTimeUs = PltGetMicroseconds();
                 }
 
                 return;
@@ -1114,7 +1126,11 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                 // If we need an RFI frame first, then drop this frame
                 // and update the reference frame invalidation window.
                 Limelog("Waiting for RFI frame\n");
-                connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+                uint64_t nowUs = PltGetMicroseconds();
+                if (!IS_SUNSHINE() || nowUs - lastRfiReportTimeUs >= RFI_WAIT_REREPORT_INTERVAL_US) {
+                    connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+                    lastRfiReportTimeUs = nowUs;
+                }
             }
 
             waitingForNextSuccessfulFrame = false;
@@ -1175,6 +1191,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative) {
 
         // Notify the host that we lost this one
         connectionDetectedFrameLoss(startFrameNumber, frameNumber);
+        lastRfiReportTimeUs = PltGetMicroseconds();
     }
 }
 

@@ -455,14 +455,18 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
         else {
             Limelog("Unable to set receive buffer size: %d\n", LastSocketError());
         }
+#endif
 
+        // Always log the size the OS actually granted. Linux and macOS accept
+        // an oversized SO_RCVBUF and silently clamp it (net.core.rmem_max,
+        // kern.ipc.maxsockbuf), so the requested value alone proves nothing.
         {
-            SOCKADDR_LEN len = sizeof(bufferSize);
-            if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, &len) == 0) {
-                Limelog("Actual receive buffer size: %d\n", bufferSize);
+            int actualSize = 0;
+            SOCKADDR_LEN len = sizeof(actualSize);
+            if (getsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&actualSize, &len) == 0) {
+                Limelog("Actual receive buffer size: %d\n", actualSize);
             }
         }
-#endif
     }
 
     return s;

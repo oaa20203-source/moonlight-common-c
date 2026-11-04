@@ -376,10 +376,11 @@ int startVideoStream(void* rendererContext, int drFlags) {
         return LastSocketError();
     }
 
-    if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
-        // A PyroWave frame can be hundreds of packets arriving at line rate.
-        // Linux silently clamps SO_RCVBUF to net.core.rmem_max, and packets
-        // beyond the clamped buffer are dropped by the kernel.
+    {
+        // Linux silently clamps SO_RCVBUF to net.core.rmem_max (default 212992,
+        // about 3 frames at 120 fps / 80 Mbps) and macOS to kern.ipc.maxsockbuf.
+        // Packets arriving while the clamped buffer is full are dropped by the
+        // kernel and show up as network loss, for every codec.
         int actualBufferSize = 0;
         SOCKADDR_LEN len = sizeof(actualBufferSize);
         if (getsockopt(rtpSocket, SOL_SOCKET, SO_RCVBUF, (char*)&actualBufferSize, &len) == 0) {
@@ -389,7 +390,8 @@ int startVideoStream(void* rendererContext, int drFlags) {
 #endif
             if (actualBufferSize < requestedBufferSize) {
                 Limelog("WARNING: video receive buffer is %d KB of %d KB requested; "
-                        "PyroWave frames may lose packets (on Linux, raise net.core.rmem_max)\n",
+                        "packets arriving while it is full are dropped by the kernel "
+                        "(on Linux, raise net.core.rmem_max)\n",
                         actualBufferSize / 1024, requestedBufferSize / 1024);
             }
         }

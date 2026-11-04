@@ -242,10 +242,14 @@ static void AudioReceiveThreadProc(void* context) {
     int queueStatus;
     bool useSelect;
     uint32_t packetsToDrop;
+    uint32_t droppedPackets;
+    uint64_t lastAudioPacketUs;
     int waitingForAudioMs;
 
     packet = NULL;
     packetsToDrop = 500 / AudioPacketDuration;
+    droppedPackets = 0;
+    lastAudioPacketUs = 0;
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
@@ -282,7 +286,11 @@ static void AudioReceiveThreadProc(void* context) {
             else {
                 // If we hit this path, there are no queued audio packets on the host PC,
                 // so we don't need to drop anything.
-                packetsToDrop = 0;
+                if (packetsToDrop > 0) {
+                    Limelog("Initial audio resync ended on receive timeout after dropping %u packets (%u ms)\n",
+                            droppedPackets, droppedPackets * AudioPacketDuration);
+                    packetsToDrop = 0;
+                }
             }
             continue;
         }
@@ -308,13 +316,38 @@ static void AudioReceiveThreadProc(void* context) {
         }
 
         // GFE accumulates audio samples before we are ready to receive them, so
-        // we will drop the ones that arrived before the receive thread was ready.
+        // we drop the ones that arrived before the receive thread was ready. A
+        // backlog drains from the socket buffer back-to-back; once two audio
+        // packets arrive at least half a packet period apart the host is sending
+        // in real time and there is nothing left to catch up on. Sunshine/Apollo
+        // usually have no backlog, so without this check 500 ms of live audio
+        // was discarded at every session start. The packet cap stays the bound.
         if (packetsToDrop > 0) {
             // Only count actual audio data (not FEC) in the packets to drop calculation
             if (rtp->packetType == 97) {
-                packetsToDrop--;
+                uint64_t nowUs = PltGetMicroseconds();
+                if (lastAudioPacketUs != 0 &&
+                        nowUs - lastAudioPacketUs >= (uint64_t)AudioPacketDuration * 500) {
+                    Limelog("Initial audio resync ended early after dropping %u packets (%u ms)\n",
+                            droppedPackets, droppedPackets * AudioPacketDuration);
+                    packetsToDrop = 0;
+                    // Fall through and process this packet normally
+                }
+                else {
+                    lastAudioPacketUs = nowUs;
+                    droppedPackets++;
+                    packetsToDrop--;
+                    if (packetsToDrop == 0) {
+                        Limelog("Initial audio resync ended after dropping %u packets (%u ms)\n",
+                                droppedPackets, droppedPackets * AudioPacketDuration);
+                    }
+                    continue;
+                }
             }
-            continue;
+            else {
+                // FEC packet during the resync window
+                continue;
+            }
         }
 
         // Convert fields to host byte-order
