@@ -58,6 +58,17 @@ bool PltIsThreadInterrupted(PLT_THREAD* thread);
 void PltJoinThread(PLT_THREAD* thread);
 void PltDetachThread(PLT_THREAD* thread);
 
+// Scheduling class for the calling thread. On Apple platforms these map to
+// QoS classes, which decide whether a thread may run on the performance
+// cores and how quickly it is scheduled when the app is busy. Elsewhere this
+// is a no-op for now.
+typedef enum {
+    PLT_THREAD_PRIO_INTERACTIVE, // input and control: latency-critical
+    PLT_THREAD_PRIO_HIGH,        // video/audio receive and decode
+    PLT_THREAD_PRIO_LOW,         // pings, stats and other housekeeping
+} PLT_THREAD_PRIO;
+void PltSetThreadPriority(PLT_THREAD_PRIO prio);
+
 int PltCreateEvent(PLT_EVENT* event);
 void PltCloseEvent(PLT_EVENT* event);
 void PltSetEvent(PLT_EVENT* event);

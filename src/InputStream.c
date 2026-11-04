@@ -333,6 +333,8 @@ static void floatToNetfloat(float in, netfloat out) {
 
 // Input thread proc
 static void inputSendThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_INTERACTIVE);
+
     SOCK_RET err;
     PPACKET_HOLDER holder;
     uint32_t multiControllerMagicLE;

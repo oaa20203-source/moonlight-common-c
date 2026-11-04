@@ -1,5 +1,10 @@
 #define _GNU_SOURCE
 #include "Limelight-internal.h"
+
+#if defined(LC_DARWIN)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #if defined(__vita__)
 #include <pthread.h>
 #include <psp2/kernel/processmgr.h>
@@ -222,6 +227,29 @@ static void thread_deallocator(OSThread *thread, void *stack) {
     free(stack);
 }
 #endif
+
+void PltSetThreadPriority(PLT_THREAD_PRIO prio) {
+#if defined(LC_DARWIN)
+    // Same classes VoidLink uses on Apple Silicon. Without them these threads
+    // run at the default class and can land on efficiency cores or wait
+    // behind the app's own work.
+    qos_class_t qos;
+    switch (prio) {
+    case PLT_THREAD_PRIO_INTERACTIVE:
+        qos = QOS_CLASS_USER_INTERACTIVE;
+        break;
+    case PLT_THREAD_PRIO_HIGH:
+        qos = QOS_CLASS_USER_INITIATED;
+        break;
+    default:
+        qos = QOS_CLASS_UTILITY;
+        break;
+    }
+    pthread_set_qos_class_self_np(qos, 0);
+#else
+    (void)prio;
+#endif
+}
 
 int PltCreateThread(const char* name, ThreadEntry entry, void* context, PLT_THREAD* thread) {
     struct thread_context* ctx;

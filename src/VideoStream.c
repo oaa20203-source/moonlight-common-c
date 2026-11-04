@@ -57,6 +57,8 @@ void destroyVideoStream(void) {
 
 // UDP Ping proc
 static void VideoPingThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+
     char legacyPingData[] = { 0x50, 0x49, 0x4E, 0x47 };
     LC_SOCKADDR saddr;
 
@@ -87,6 +89,8 @@ static void VideoPingThreadProc(void* context) {
 
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_HIGH);
+
     int err;
     int bufferSize, receiveSize, decryptedSize, minSize;
     char* buffer;
@@ -289,6 +293,8 @@ void notifyKeyFrameReceived(void) {
 
 // Decoder thread proc
 static void VideoDecoderThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_HIGH);
+
     while (!PltIsThreadInterrupted(&decoderThread)) {
         VIDEO_FRAME_HANDLE frameHandle;
         PDECODE_UNIT decodeUnit;

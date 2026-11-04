@@ -959,6 +959,8 @@ static bool canBatchAsyncCallback(void* current, void* next) {
 }
 
 static void asyncCallbackThreadFunc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_INTERACTIVE);
+
     PQUEUED_ASYNC_CALLBACK queuedCb, nextCb;
 
     while (LbqWaitForQueueElement(&asyncCallbackQueue, (void**)&queuedCb) == LBQ_SUCCESS) {
@@ -1228,6 +1230,8 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
 }
 
 static void controlReceiveThreadFunc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_HIGH);
+
     int err;
 
     // This is only used for ENet
@@ -1533,6 +1537,8 @@ static void controlReceiveThreadFunc(void* context) {
 }
 
 static void lossStatsThreadFunc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+
     BYTE_BUFFER byteBuffer;
 
     if (usePeriodicPing) {
@@ -1727,6 +1733,8 @@ static void confirmLongtermReferenceFrame(uint32_t frameIndex) {
 }
 
 static void referenceFrameControlFunc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+
     LC_ASSERT(isReferenceFrameInvalidationEnabled());
 
     while (!PltIsThreadInterrupted(&invalidateRefFramesThread)) {
@@ -1769,6 +1777,8 @@ static void referenceFrameControlFunc(void* context) {
 }
 
 static void requestIdrFrameFunc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+
     while (!PltIsThreadInterrupted(&requestIdrFrameThread)) {
         PltWaitForEvent(&idrFrameRequiredEvent);
         PltClearEvent(&idrFrameRequiredEvent);

@@ -36,6 +36,8 @@ typedef struct _QUEUED_AUDIO_PACKET {
 } QUEUED_AUDIO_PACKET, *PQUEUED_AUDIO_PACKET;
 
 static void AudioPingThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+
     char legacyPingData[] = { 0x50, 0x49, 0x4E, 0x47 };
     LC_SOCKADDR saddr;
 
@@ -237,6 +239,8 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
 }
 
 static void AudioReceiveThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_HIGH);
+
     PRTP_PACKET rtp;
     PQUEUED_AUDIO_PACKET packet;
     int queueStatus;
@@ -416,6 +420,8 @@ static void AudioReceiveThreadProc(void* context) {
 }
 
 static void AudioDecoderThreadProc(void* context) {
+    PltSetThreadPriority(PLT_THREAD_PRIO_INTERACTIVE);
+
     int err;
     PQUEUED_AUDIO_PACKET packet;
 
