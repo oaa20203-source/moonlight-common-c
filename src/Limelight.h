@@ -1214,6 +1214,12 @@ const char* LiGetHostPyroWaveBitstreamId(void);
 // frame, just that an IDR frame will arrive soon.
 void LiRequestIdrFrame(void);
 
+// Runs the host's server command at index cmdId of the ServerCommand list from
+// /serverinfo (Apollo/Vibepollo extension; needs the server_cmd permission on the
+// host). Returns 0 when sent, -1 when unsupported or not streaming, -2 on send failure.
+// The host does not reply.
+int LiSendExecServerCmd(uint8_t cmdId);
+
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported

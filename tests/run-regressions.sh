@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host tests of the Steam Controller (2026) protocol extensions. They compile the
+# Host tests of the Steam Controller (2026) and Apollo server-command protocol extensions. They compile the
 # production source under test into the test binary and link the rest from a
 # CMake build of the library (shared on Linux/macOS, the import library on MinGW).
 set -eu
@@ -10,7 +10,7 @@ cc=${CC:-cc}
 # System libraries the production sources under test call directly (sockets on Windows).
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) syslibs="-lws2_32 -lwinmm" ;; *) syslibs= ;; esac
 # Match sanitizer flags used to build the library via CFLAGS, when applicable.
-for test in steam_haptic steam_settings steam_attributes controller_batching control_truncation input_motion; do
+for test in steam_haptic steam_settings steam_attributes controller_batching control_truncation input_motion exec_server_cmd; do
     extra_flags=
     # Exercise the input producer assertions in debug builds.
     if [ "$test" = controller_batching ]; then extra_flags=-DLC_DEBUG; fi
@@ -26,3 +26,4 @@ done
 "$build/test-controller_batching"
 "$build/test-control_truncation"
 "$build/test-input_motion"
+"$build/test-exec_server_cmd"

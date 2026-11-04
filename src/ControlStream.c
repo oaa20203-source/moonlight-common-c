@@ -155,6 +155,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_DS_ADAPTIVE_TRIGGERS 12
 #define IDX_STEAM_HAPTIC 13
 #define IDX_STEAM_SETTINGS 14
+#define IDX_EXEC_SERVER_CMD 15
 // Settings chunks queued for the listener at most; a burst of haptic events never evicts one
 // (a 20-triple write arrives as three chunks, and a dropped chunk is a partial write applied).
 #define STEAM_SETTINGS_QUEUE_LIMIT 16
@@ -178,6 +179,7 @@ static const short packetTypesGen3[] = {
     -1,     // Adaptive triggers (unused)
     -1,     // Steam Controller haptic report (unused)
     -1,     // Steam Controller settings write (unused)
+    -1,     // Execute server command (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -195,6 +197,7 @@ static const short packetTypesGen4[] = {
     -1,     // Adaptive triggers (unused)
     -1,     // Steam Controller haptic report (unused)
     -1,     // Steam Controller settings write (unused)
+    -1,     // Execute server command (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -212,6 +215,7 @@ static const short packetTypesGen5[] = {
     -1,     // Adaptive triggers (unused)
     -1,     // Steam Controller haptic report (unused)
     -1,     // Steam Controller settings write (unused)
+    -1,     // Execute server command (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -229,6 +233,7 @@ static const short packetTypesGen7[] = {
     -1,     // Adaptive triggers (unused)
     -1,     // Steam Controller haptic report (unused)
     -1,     // Steam Controller settings write (unused)
+    -1,     // Execute server command (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -246,6 +251,7 @@ static const short packetTypesGen7Enc[] = {
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
     0x5504, // Steam Controller haptic report (Vibepollo protocol extension)
     0x5505, // Steam Controller settings write (Vibepollo protocol extension)
+    0x3000, // Execute server command (Apollo protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -2224,4 +2230,28 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
 
     *metadata = hdrMetadata;
     return true;
+}
+
+// Run the host's server command at this index of the ServerCommand list in
+// /serverinfo (Apollo protocol extension, control packet 0x3000). Returns 0 when
+// the command was handed to the control stream, -1 when the stream is not
+// running or the host protocol has no server commands, -2 when sending failed.
+int LiSendExecServerCmd(uint8_t cmdId) {
+    uint8_t payload[4] = { cmdId, 0, 0, 0 };
+
+    if (peer == NULL || stopping || packetTypes == NULL || packetTypes[IDX_EXEC_SERVER_CMD] == -1) {
+        return -1;
+    }
+
+    if (!sendMessageAndForget(packetTypes[IDX_EXEC_SERVER_CMD],
+                              sizeof(payload),
+                              payload,
+                              CTRL_CHANNEL_SERVERCTL,
+                              ENET_PACKET_FLAG_RELIABLE,
+                              false)) {
+        Limelog("Server command: transaction failed: %d\n", (int)LastSocketError());
+        return -2;
+    }
+
+    return 0;
 }
