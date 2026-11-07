@@ -271,7 +271,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
-        uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+        // ML_FF_FEC_STATUS is not advertised: the client no longer sends the
+        // per-frame FEC status messages (see connectionSendFrameFecStatus)
+        uint32_t moonlightFeatureFlags = ML_FF_SESSION_ID_V1;
         if (ListenerCallbacks.controllerHaptics) moonlightFeatureFlags |= ML_FF_HAPTICS_PCM;
         if (ControllerSpeakerPcmCallback)
             moonlightFeatureFlags |= ML_FF_CONTROLLER_SPEAKER_PCM;

@@ -10,9 +10,10 @@
 #define FEC_VERBOSE
 #endif
 
-// Don't try speculative RFI for 5 minutes after seeing
-// an out of order packet or incorrect prediction
-#define SPECULATIVE_RFI_COOLDOWN_PERIOD_US 300000000
+// Don't try speculative RFI for 30 seconds after seeing an out of order packet or
+// an incorrect prediction. Upstream waits 5 minutes, but on Wi-Fi a single
+// reordered packet would then switch early loss reports off for most of a session.
+#define SPECULATIVE_RFI_COOLDOWN_PERIOD_US 30000000
 
 // RTP packets use a 90 KHz presentation timestamp clock
 #define PTS_DIVISOR 90
@@ -41,7 +42,15 @@ void LiSetVideoReassemblyDeadlineCallback(LiVideoReassemblyDeadlineCallback call
     reassemblyDeadlineCallback = callback;
 }
 
+// The longest time with no video packets at all since the last query: a Wi-Fi
+// outage. A wait for a recovery frame still receives packets, so it doesn't count.
+static volatile uint64_t lastVideoPacketUs;
+static volatile uint64_t longestVideoPacketGapUs;
+
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue) {
+    lastVideoPacketUs = 0;
+    longestVideoPacketGapUs = 0;
+
     reed_solomon_init();
     memset(queue, 0, sizeof(*queue));
 
@@ -778,7 +787,29 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+uint64_t LiGetAndResetLongestVideoPacketGapUs(void) {
+    uint64_t nowUs = PltGetMicroseconds();
+    uint64_t longestUs = longestVideoPacketGapUs;
+    uint64_t lastUs = lastVideoPacketUs;
+
+    // Include a gap that is still going on
+    if (lastUs != 0 && nowUs > lastUs && nowUs - lastUs > longestUs) {
+        longestUs = nowUs - lastUs;
+    }
+    longestVideoPacketGapUs = 0;
+    return longestUs;
+}
+
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+    {
+        uint64_t nowUs = PltGetMicroseconds();
+        uint64_t lastUs = lastVideoPacketUs;
+        if (lastUs != 0 && nowUs > lastUs && nowUs - lastUs > longestVideoPacketGapUs) {
+            longestVideoPacketGapUs = nowUs - lastUs;
+        }
+        lastVideoPacketUs = nowUs;
+    }
+
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
         return RTPF_RET_REJECTED;

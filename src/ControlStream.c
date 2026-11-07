@@ -132,6 +132,22 @@ static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
 static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
 static PLT_EVENT idrFrameRequiredEvent;
 
+// A host answers every IDR request with a full keyframe (about 90 kB at 3K), and on
+// a lossy link that burst causes more loss and more requests. Send at most one IDR
+// request per IDR_REQUEST_MIN_INTERVAL_MS. A request made while one is in flight is
+// held, and dropped if a keyframe arrives after it was made: that keyframe already
+// recovers the decoder.
+#define IDR_REQUEST_MIN_INTERVAL_MS 500
+static volatile uint64_t lastIdrRequestedUs;
+static volatile uint64_t lastKeyFrameReceivedUs;
+static unsigned int idrRequestsSent;
+static unsigned int idrRequestsHeld;
+static unsigned int rfiRequestsSent;
+// RFI acknowledgement timing: a reliable packet is freed once the host acknowledges
+// it, so its free callback times the uplink (the request's way there plus the ACK's
+// way back). Each packet carries its own send time, in ms since this epoch.
+static uint64_t rfiTimingEpochUs;
+
 static PPLT_CRYPTO_CONTEXT encryptionCtx;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
@@ -386,6 +402,12 @@ int initializeControlStream(void) {
     lastGoodFrame = 0;
     lastSeenFrame = 0;
     disconnectPending = false;
+    lastIdrRequestedUs = 0;
+    lastKeyFrameReceivedUs = 0;
+    idrRequestsSent = 0;
+    rfiTimingEpochUs = PltGetMicroseconds();
+    idrRequestsHeld = 0;
+    rfiRequestsSent = 0;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
     intervalStartTimeMs = 0;
@@ -460,7 +482,13 @@ void LiRequestIdrFrame(void) {
     freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
 
     // Request the IDR frame
+    lastIdrRequestedUs = PltGetMicroseconds();
     PltSetEvent(&idrFrameRequiredEvent);
+}
+
+// The depacketizer finished a keyframe
+void connectionReceivedKeyFrame(void) {
+    lastKeyFrameReceivedUs = PltGetMicroseconds();
 }
 
 // Invalidate reference frames lost by the network
@@ -495,19 +523,11 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
 }
 
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
-    // This is a Sunshine protocol extension
-    if (!IS_SUNSHINE()) {
-        return;
-    }
-
-    // Queue a frame FEC status message. This is best-effort only.
-    PQUEUED_FRAME_FEC_STATUS queuedFecStatus = malloc(sizeof(*queuedFecStatus));
-    if (queuedFecStatus != NULL) {
-        queuedFecStatus->fecStatus = *fecStatus;
-        if (LbqOfferQueueItem(&frameFecStatusQueue, queuedFecStatus, &queuedFecStatus->entry) == LBQ_BOUND_EXCEEDED) {
-            free(queuedFecStatus);
-        }
-    }
+    // Per-frame FEC status (packet type 0x5502, SS_FRAME_FEC_PTYPE) is a Sunshine
+    // protocol extension that Vibepollo does not handle: it logs it as an unknown
+    // message and drops it. It is sent on every lost frame, on the same uplink as
+    // the RFI that actually recovers the loss, so it is not sent at all.
+    (void)fecStatus;
 }
 
 void connectionSawFrame(uint32_t frameIndex) {
@@ -711,6 +731,19 @@ static void enetPacketFreeCb(ENetPacket* packet) {
     }
 }
 
+static uint32_t rfiTimingNowMs(void) {
+    return (uint32_t)((PltGetMicroseconds() - rfiTimingEpochUs) / 1000);
+}
+
+// Runs under enetMutex. Packets are also freed when the peer resets or the
+// stream stops; those were never acknowledged, so they are not logged.
+static void rfiPacketAckedCb(ENetPacket* packet) {
+    if (!stopping && peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+        const uint32_t sentMs = (uint32_t)(uintptr_t)packet->userData;
+        Limelog("RFI acked after %u ms\n", rfiTimingNowMs() - sentMs);
+    }
+}
+
 
 // Must be called with enetMutex held
 static bool isPacketSentWaitingForAck(ENetPacket* packet) {
@@ -808,6 +841,9 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
         channelId = 0;
     }
 
+    const bool isRfi = ptype == packetTypes[IDX_INVALIDATE_REF_FRAMES] && (flags & ENET_PACKET_FLAG_RELIABLE);
+    const uint32_t sendMs = isRfi ? rfiTimingNowMs() : 0;
+
     // Queue the packet to be sent
     err = enet_peer_send(peer, channelId, enetPacket);
     bool packetQueued = (err == 0);
@@ -845,6 +881,15 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     if (!packetFreed) {
         enetPacket->userData = NULL;
         enetPacket->freeCallback = NULL;
+        if (isRfi && packetQueued && err >= 0) {
+            // Time the acknowledgement of this RFI (see rfiPacketAckedCb)
+            enetPacket->userData = (void*)(uintptr_t)sendMs;
+            enetPacket->freeCallback = rfiPacketAckedCb;
+        }
+    }
+    else if (isRfi && err >= 0 && peer->state == ENET_PEER_STATE_CONNECTED) {
+        // Acknowledged within the send wait
+        Limelog("RFI acked after %u ms\n", rfiTimingNowMs() - sendMs);
     }
 
     PltUnlockMutex(&enetMutex);
@@ -1730,6 +1775,7 @@ static void requestInvalidateReferenceFrames(uint32_t startFrame, uint32_t endFr
         ListenerCallbacks.connectionTerminated(LastSocketFail());
         return;
     }
+    rfiRequestsSent++;
 
     Limelog("Invalidate reference frame request sent (%d to %d)\n", startFrame, endFrame);
 }
@@ -1755,7 +1801,9 @@ static void confirmLongtermReferenceFrame(uint32_t frameIndex) {
 }
 
 static void referenceFrameControlFunc(void* context) {
-    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+    // RFI requests are latency-critical: the host's reference window is only a
+    // few frames, and every millisecond the request waits is part of it
+    PltSetThreadPriority(PLT_THREAD_PRIO_INTERACTIVE);
 
     LC_ASSERT(isReferenceFrameInvalidationEnabled());
 
@@ -1764,6 +1812,8 @@ static void referenceFrameControlFunc(void* context) {
         uint32_t invalidateStartFrame;
         uint32_t invalidateEndFrame;
         bool invalidate = false;
+        uint32_t ltrAcks[32];
+        int ltrAckCount = 0;
 
         // Wait for a reference frame control message or a request to shutdown
         if (LbqWaitForQueueElement(&referenceFrameControlQueue, (void**)&qfit) != LBQ_SUCCESS) {
@@ -1785,8 +1835,14 @@ static void referenceFrameControlFunc(void* context) {
                 }
             }
             else {
-                // Send LTR frame ACK
-                confirmLongtermReferenceFrame(qfit->startFrame);
+                // LTR frame ACKs go out after any invalidation request, in order
+                if (ltrAckCount == (int)(sizeof(ltrAcks) / sizeof(ltrAcks[0]))) {
+                    for (int i = 0; i < ltrAckCount; i++) {
+                        confirmLongtermReferenceFrame(ltrAcks[i]);
+                    }
+                    ltrAckCount = 0;
+                }
+                ltrAcks[ltrAckCount++] = qfit->startFrame;
             }
             free(qfit);
         } while (LbqPollQueueElement(&referenceFrameControlQueue, (void**)&qfit) == LBQ_SUCCESS);
@@ -1795,11 +1851,17 @@ static void referenceFrameControlFunc(void* context) {
             // Send the reference frame invalidation request
             requestInvalidateReferenceFrames(invalidateStartFrame, invalidateEndFrame);
         }
+        for (int i = 0; i < ltrAckCount; i++) {
+            confirmLongtermReferenceFrame(ltrAcks[i]);
+        }
     }
 }
 
 static void requestIdrFrameFunc(void* context) {
-    PltSetThreadPriority(PLT_THREAD_PRIO_LOW);
+    uint64_t lastSentUs = 0;
+
+    // A needed IDR request is as latency-critical as an RFI
+    PltSetThreadPriority(PLT_THREAD_PRIO_INTERACTIVE);
 
     while (!PltIsThreadInterrupted(&requestIdrFrameThread)) {
         PltWaitForEvent(&idrFrameRequiredEvent);
@@ -1810,16 +1872,39 @@ static void requestIdrFrameFunc(void* context) {
             return;
         }
 
+        if (lastSentUs != 0) {
+            uint64_t sinceUs = PltGetMicroseconds() - lastSentUs;
+            if (sinceUs < IDR_REQUEST_MIN_INTERVAL_MS * 1000ULL) {
+                idrRequestsHeld++;
+                PltSleepMsInterruptible(&requestIdrFrameThread,
+                                        (int)(IDR_REQUEST_MIN_INTERVAL_MS - sinceUs / 1000));
+                if (stopping || PltIsThreadInterrupted(&requestIdrFrameThread)) {
+                    return;
+                }
+            }
+            if (lastKeyFrameReceivedUs > lastIdrRequestedUs) {
+                // A keyframe arrived after the newest request: nothing left to recover.
+                // Don't clear the event here: a request made since the check must stay set.
+                continue;
+            }
+            // Requests made while we waited are covered by this one
+            PltClearEvent(&idrFrameRequiredEvent);
+        }
+
         // Any pending RFI requests and LTR frame ACK messages are now redundant
         freeBasicLbqList(LbqFlushQueueItems(&referenceFrameControlQueue));
 
         // Request the IDR frame
         requestIdrFrame();
+        lastSentUs = PltGetMicroseconds();
+        idrRequestsSent++;
     }
 }
 
 // Stops the control stream
 int stopControlStream(void) {
+    Limelog("Recovery requests this stream: %u IDR sent (%u held back), %u RFI sent\n",
+            idrRequestsSent, idrRequestsHeld, rfiRequestsSent);
     stopping = true;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);

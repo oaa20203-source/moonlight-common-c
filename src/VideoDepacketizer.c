@@ -31,14 +31,40 @@ static uint16_t pyrowaveCriticalPackets;
 #define CONSECUTIVE_DROP_LIMIT 120
 static unsigned int consecutiveFrameDrops;
 
-// Sunshine-protocol hosts expand an RFI request to their last encoded frame,
-// so re-sending the same range with a growing end frame for every complete
-// frame we discard while waiting for the RFI frame carries no information and
-// floods the reliable control channel that mouse and gamepad input share.
-// Rate-limit those re-sends; genuine new losses still report immediately.
+// Sunshine-protocol hosts expand an RFI request to their last encoded frame and
+// skip ranges they have already recovered, and the control channel is reliable,
+// so once a request is out, a second one for the same loss only costs another
+// recovery frame (often a full IDR frame). After one request the client sends no
+// more RFIs until the recovery frame arrives. Frames lost meanwhile need nothing:
+// the host's recovery covers everything it encoded before it.
+//
+// Only if the recovery frame itself is lost does the client ask again, and then
+// for one IDR frame. It knows the recovery was lost when it receives a frame the
+// host encoded after the request reached it (judged by the frame's RTP timestamp
+// on the host's clock), which is not the recovery. On a congested link the frames
+// still queued from before the request keep arriving for a while; they are older
+// than the request and say nothing about the recovery, so a timer would misfire.
+// RFI_RECOVERY_TIMEOUT_US is only the fallback for hosts with unusable timestamps;
+// otherwise a 3 s safety limit applies.
 // GFE hosts keep per-frame updates.
-#define RFI_WAIT_REREPORT_INTERVAL_US 100000
-static uint64_t lastRfiReportTimeUs;
+#define RFI_RECOVERY_SLACK_FRAMES 4
+#define RFI_RECOVERY_TIMEOUT_US 1000000
+// With usable timestamps, only this long a wait escalates on time alone
+#define RFI_RECOVERY_SAFETY_TIMEOUT_US 3000000
+// When the outstanding RFI request was sent; 0 when none is outstanding
+static uint64_t rfiOutstandingSinceUs;
+static bool rfiSuppressionLogged;
+
+// The host's clock, estimated from frame RTP timestamps (90 kHz, host capture
+// time): receive time minus RTP time is the one-way delay plus the offset between
+// the two clocks. Its minimum over the last 10-20 s is the uncongested baseline.
+#define OWD_EPOCH_US 10000000
+static uint32_t lastRtpTimestamp;
+static uint64_t rtpWraps;
+static bool owdValid;
+static int64_t owdMinPrevEpochUs, owdMinThisEpochUs;
+static uint64_t owdEpochStartUs;
+static int64_t latestFrameRtpUs;
 
 static LINKED_BLOCKING_QUEUE decodeUnitQueue;
 
@@ -70,7 +96,13 @@ typedef struct _LENTRY_INTERNAL {
 
 // Init
 void initializeVideoDepacketizer(int pktSize) {
-    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
+    // Room for about one second of frames. After a Wi-Fi stall the frames that were
+    // held up arrive in one burst, faster than any decoder takes them; a queue
+    // that overflows has to be flushed and costs a full IDR frame, while a burst
+    // that fits only delays the stream until the decoder catches up (the pacer
+    // shows the newest frame). Never fewer than the original 15.
+    LbqInitializeLinkedBlockingQueue(&decodeUnitQueue,
+                                     StreamConfig.fps > 15 ? (StreamConfig.fps < 240 ? StreamConfig.fps : 240) : 15);
 
     nextFrameNumber = 1;
     startFrameNumber = 0;
@@ -88,7 +120,14 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     pyrowaveCriticalPackets = 0;
-    lastRfiReportTimeUs = 0;
+    rfiOutstandingSinceUs = 0;
+    rfiSuppressionLogged = false;
+    lastRtpTimestamp = 0;
+    rtpWraps = 0;
+    owdValid = false;
+    owdMinPrevEpochUs = owdMinThisEpochUs = INT64_MAX;
+    owdEpochStartUs = 0;
+    latestFrameRtpUs = 0;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
 
@@ -519,6 +558,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
                 qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
                 notifyKeyFrameReceived();
+                connectionReceivedKeyFrame();
             }
             else {
                 qdu->decodeUnit.frameType = FRAME_TYPE_PFRAME;
@@ -760,6 +800,102 @@ static bool isFirstPacket(uint8_t flags, uint8_t fecBlockNumber) {
     return (flags == (FLAG_SOF | FLAG_EOF) || flags == FLAG_SOF) && fecBlockNumber == 0;
 }
 
+// Called at the start of every frame
+static void noteFrameTiming(uint64_t receiveTimeUs, uint32_t rtpTimestamp) {
+    int64_t rtpUs, owdUs;
+
+    if (rtpTimestamp == 0) {
+        return;
+    }
+    if (lastRtpTimestamp != 0 && rtpTimestamp < lastRtpTimestamp && lastRtpTimestamp - rtpTimestamp > 0x80000000U) {
+        rtpWraps++;
+    }
+    lastRtpTimestamp = rtpTimestamp;
+    rtpUs = (int64_t)(((rtpWraps << 32) | rtpTimestamp) * 1000 / 90);
+    latestFrameRtpUs = rtpUs;
+
+    owdUs = (int64_t)receiveTimeUs - rtpUs;
+    if (owdEpochStartUs == 0 || receiveTimeUs - owdEpochStartUs >= OWD_EPOCH_US) {
+        owdMinPrevEpochUs = owdMinThisEpochUs;
+        owdMinThisEpochUs = INT64_MAX;
+        owdEpochStartUs = receiveTimeUs;
+    }
+    if (owdUs < owdMinThisEpochUs) {
+        owdMinThisEpochUs = owdUs;
+    }
+    owdValid = true;
+}
+
+static int64_t owdBaselineUs(void) {
+    return owdMinPrevEpochUs < owdMinThisEpochUs ? owdMinPrevEpochUs : owdMinThisEpochUs;
+}
+
+// True once a frame arrives that the host encoded after the outstanding request
+// reached it: the recovery frame should have come before it
+static bool rfiRecoveryLost(uint64_t nowUs) {
+    uint32_t rttMs = 0, rttVarianceMs = 0;
+    int64_t requestAtHostUs, slackUs;
+
+    if (!owdValid || latestFrameRtpUs == 0) {
+        return nowUs - rfiOutstandingSinceUs >= RFI_RECOVERY_TIMEOUT_US;
+    }
+
+    LiGetEstimatedRttInfo(&rttMs, &rttVarianceMs);
+    // Host clock at the request's arrival: client send time, plus half a round
+    // trip on the way there, minus (baseline one-way delay + clock offset), plus
+    // the half round trip the baseline includes
+    requestAtHostUs = (int64_t)rfiOutstandingSinceUs + (int64_t)rttMs * 1000 - owdBaselineUs();
+    // Allow for the host's encoder pipeline, and for one uplink retransmission of
+    // the request (two round trips) on a lossy link
+    slackUs = (int64_t)RFI_RECOVERY_SLACK_FRAMES * 1000000 / (StreamConfig.fps > 0 ? StreamConfig.fps : 60) +
+              (int64_t)(2 * rttMs + rttVarianceMs) * 1000;
+    return latestFrameRtpUs > requestAtHostUs + slackUs ||
+           nowUs - rfiOutstandingSinceUs >= RFI_RECOVERY_SAFETY_TIMEOUT_US;
+}
+
+// Report lost frames to the host as soon as they are known lost, unless a request
+// for an earlier loss is still waiting for its recovery frame (see above).
+static void reportFrameLoss(uint32_t startFrame, uint32_t endFrame) {
+    uint64_t nowUs = PltGetMicroseconds();
+
+    if (IS_SUNSHINE() && rfiOutstandingSinceUs != 0) {
+        uint64_t waitedUs = nowUs - rfiOutstandingSinceUs;
+        if (!rfiRecoveryLost(nowUs)) {
+            if (!rfiSuppressionLogged) {
+                Limelog("RFI for frames %u to %u held: the recovery frame for the last request is still due (%u ms ago)\n",
+                        startFrame, endFrame, (unsigned int)(waitedUs / 1000));
+                rfiSuppressionLogged = true;
+            }
+            return;
+        }
+
+        // The recovery frame went missing: ask once for an IDR frame instead of
+        // another RFI that the host would expand again
+        Limelog("Recovery frame for the RFI sent %u ms ago was lost (frames encoded after it arrived); requesting an IDR frame\n",
+                (unsigned int)(waitedUs / 1000));
+        rfiOutstandingSinceUs = 0;
+        rfiSuppressionLogged = false;
+        waitingForIdrFrame = true;
+        waitingForRefInvalFrame = false;
+        LiRequestIdrFrame();
+        return;
+    }
+
+    connectionDetectedFrameLoss(startFrame, endFrame);
+    rfiOutstandingSinceUs = nowUs;
+    rfiSuppressionLogged = false;
+}
+
+// The host's recovery frame (or an IDR frame) arrived
+static void rfiRecoveryFrameArrived(uint32_t frameIndex) {
+    if (rfiOutstandingSinceUs != 0) {
+        Limelog("Recovery frame %u arrived %u ms after the RFI request\n", frameIndex,
+                (unsigned int)((PltGetMicroseconds() - rfiOutstandingSinceUs) / 1000));
+        rfiOutstandingSinceUs = 0;
+        rfiSuppressionLogged = false;
+    }
+}
+
 // Process an RTP Payload
 // The caller will free *existingEntry unless we NULL it
 // A lost payload is a zero-filled stand-in from the RtpVideoQueue (PyroWave only)
@@ -771,6 +907,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
     uint8_t flags;
     uint8_t extraFlags;
     bool firstPacket, lastPacket;
+    bool framesLostBeforeThis = false;
     uint32_t streamPacketIndex;
     uint8_t fecCurrentBlockNumber;
     uint8_t fecLastBlockNumber;
@@ -813,8 +950,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             LiRequestIdrFrame();
         }
         else {
-            connectionDetectedFrameLoss(startFrameNumber, frameIndex);
-            lastRfiReportTimeUs = PltGetMicroseconds();
+            reportFrameLoss(startFrameNumber, frameIndex);
         }
         return;
     }
@@ -842,6 +978,10 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             // Wait until next complete frame
             waitingForNextSuccessfulFrame = true;
             dropFrameState();
+
+            // Reported below, once this frame's header shows whether it is itself
+            // the recovery
+            framesLostBeforeThis = true;
         }
         else {
             LC_ASSERT(nextFrameNumber == frameIndex);
@@ -866,6 +1006,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         }
 
         firstPacketRtpTimestamp = rtpTimestamp;
+        noteFrameTiming(receiveTimeUs, rtpTimestamp);
     }
 
     lastPacketInStream = streamPacketIndex;
@@ -898,6 +1039,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                     waitingForRefInvalFrame = false;
                     waitingForNextSuccessfulFrame = false;
                 }
+                rfiRecoveryFrameArrived(frameIndex);
                 break;
             case 104: // Sunshine hardcoded header
                 break;
@@ -910,10 +1052,22 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         else {
             // Hope for the best with older servers
             if (waitingForRefInvalFrame) {
-                connectionDetectedFrameLoss(startFrameNumber, frameIndex - 1);
+                // No frame headers to show the recovery: treat any request as answered
+                rfiOutstandingSinceUs = 0;
+                reportFrameLoss(startFrameNumber, frameIndex - 1);
+                rfiOutstandingSinceUs = 0;
                 waitingForRefInvalFrame = false;
                 waitingForNextSuccessfulFrame = false;
             }
+        }
+
+        // Frames went missing before this one, and this one is not a recovery
+        // frame: on Sunshine hosts, report the loss now rather than at the end of
+        // this frame, so the host's recovery covers fewer frames. An IDR frame is
+        // still only requested after a complete frame.
+        if (framesLostBeforeThis && IS_SUNSHINE() && APP_VERSION_AT_LEAST(7, 1, 350) &&
+                !waitingForIdrFrame && waitingForRefInvalFrame) {
+            reportFrameLoss(startFrameNumber, frameIndex - 1);
         }
 
         // Sunshine can provide host processing latency of the frame
@@ -1089,8 +1243,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                     LiRequestIdrFrame();
                 }
                 else {
-                    connectionDetectedFrameLoss(startFrameNumber, frameIndex);
-                    lastRfiReportTimeUs = PltGetMicroseconds();
+                    reportFrameLoss(startFrameNumber, frameIndex);
                 }
 
                 return;
@@ -1126,11 +1279,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                 // If we need an RFI frame first, then drop this frame
                 // and update the reference frame invalidation window.
                 Limelog("Waiting for RFI frame\n");
-                uint64_t nowUs = PltGetMicroseconds();
-                if (!IS_SUNSHINE() || nowUs - lastRfiReportTimeUs >= RFI_WAIT_REREPORT_INTERVAL_US) {
-                    connectionDetectedFrameLoss(startFrameNumber, frameIndex);
-                    lastRfiReportTimeUs = nowUs;
-                }
+                reportFrameLoss(startFrameNumber, frameIndex);
             }
 
             waitingForNextSuccessfulFrame = false;
@@ -1190,8 +1339,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative) {
         nextFrameNumber = frameNumber + 1;
 
         // Notify the host that we lost this one
-        connectionDetectedFrameLoss(startFrameNumber, frameNumber);
-        lastRfiReportTimeUs = PltGetMicroseconds();
+        reportFrameLoss(startFrameNumber, frameNumber);
     }
 }
 
